@@ -22,6 +22,11 @@ from tests.unit_tests.test_utilities import Utils
 success_string = "hello,world"
 
 
+from megatron.plugin.platform import get_platform
+cur_platform = get_platform()
+
+
+
 @util.experimental_cls(introduced_with_version="0.1.0")
 class A:
 
@@ -85,7 +90,7 @@ def test_experimental_cls_exception_static():
 def test_global_memory_buffer():
     global_memory_buffer = util.GlobalMemoryBuffer()
     obtained_tensor = global_memory_buffer.get_tensor((3, 2), torch.float32, "test_tensor")
-    expected_tensor = torch.empty((3, 2), dtype=torch.float32, device=torch.cuda.current_device())
+    expected_tensor = torch.empty((3, 2), dtype=torch.float32, device=cur_platform.current_device())
     assert obtained_tensor.shape == expected_tensor.shape
 
 
@@ -117,7 +122,7 @@ def _init_distributed(world, rank):
     Utils.initialize_distributed()
     assert torch.distributed.is_initialized() == True
     assert torch.distributed.get_rank() == rank
-    assert torch.cuda.device_count() == world
+    assert cur_platform.device_count() == world
     torch.distributed.barrier()
 
 
