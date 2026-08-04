@@ -4,6 +4,21 @@ ENV_VARS:
   NON_DETERMINSTIC_RESULTS: 1
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
+BEFORE_SCRIPT: |
+  export HF_MODULES_CACHE="$(mktemp -d /tmp/hf-modules.XXXXXX)"
+  python3 - <<'PY'
+  from transformers import AutoTokenizer
+
+  tokenizer = AutoTokenizer.from_pretrained(
+      "/home/gitlab-runner/tokenizers/qwentokenizer",
+      trust_remote_code=True,
+      use_fast=True,
+      local_files_only=True,
+  )
+  assert type(tokenizer).__name__ == "QWenTokenizer"
+  assert len(tokenizer) == 151851
+  print("Preloaded tokenizer:", type(tokenizer).__name__, len(tokenizer))
+  PY
 MODEL_ARGS:
   --num-layers: 28
   --hidden-size: 1024
