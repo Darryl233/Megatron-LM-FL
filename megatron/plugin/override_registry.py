@@ -127,3 +127,18 @@ register(
     impl="megatron.plugin.Ascend.transformer.transformer_config.NPUTransformerConfig",
     vendor="npu",
 )
+
+# =============================================================================
+# SSM - Gated Delta Net
+# =============================================================================
+register(
+    target="megatron.core.ssm.gated_delta_net.apply_gdn_qk_l2norm",
+    impl="megatron.plugin.Ascend.ssm.gated_delta_net.apply_gdn_qk_l2norm",
+    vendor="npu",
+)
+
+register(
+    target="megatron.core.ssm.gated_delta_net.run_gated_delta_rule",
+    impl="megatron.plugin.Ascend.ssm.gated_delta_net.run_gated_delta_rule",
+    vendor="npu",
+)

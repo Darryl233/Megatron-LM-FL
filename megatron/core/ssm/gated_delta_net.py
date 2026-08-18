@@ -32,6 +32,7 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+from megatron.plugin.decorators import overridable
 
 # TODO: Implement GatedDeltaNetContextParallel
 # from .gated_delta_net_context_parallel import GatedDeltaNetContextParallel
@@ -54,6 +55,50 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+@overridable
+def apply_gdn_qk_l2norm(query: Tensor, key: Tensor) -> Tuple[Tensor, Tensor]:
+    """Portable Q/K normalization used when no platform plugin overrides it."""
+
+    def _l2norm_torch(x: Tensor, eps: float = 1e-6) -> Tensor:
+        norm = torch.norm(x, p=2, dim=-1, keepdim=True).clamp(min=eps)
+        return x / norm
+
+    return _l2norm_torch(query.contiguous()), _l2norm_torch(key.contiguous())
+
+
+@overridable
+def run_gated_delta_rule(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    g: Tensor,
+    beta: Tensor,
+    deterministic_mode: bool,
+):
+    """Run the portable deterministic path or the regular FLA implementation."""
+    if deterministic_mode or not HAVE_FLA:
+        return torch_chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+        )
+    return chunk_gated_delta_rule(
+        query,
+        key,
+        value,
+        g=g,
+        beta=beta,
+        initial_state=None,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=False,
+    )
 
 
 @dataclass
@@ -228,13 +273,6 @@ class GatedDeltaNet(MegatronModule):
 
         self.reset_parameters()
 
-        self.fla_supported = True
-        try:
-            import torch_npu
-            self.fla_supported = False if torch.npu.is_available() else True
-        except:
-            pass
-
     def reset_parameters(self):
         """Reset the parameters."""
         if self.config.perform_initialization:
@@ -357,13 +395,7 @@ class GatedDeltaNet(MegatronModule):
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            # Use PyTorch-native l2norm instead of fla's triton kernel
-            # which produces NaN in backward on Ascend NPU
-            def _l2norm_torch(x, eps=1e-6):
-                norm = torch.norm(x, p=2, dim=-1, keepdim=True).clamp(min=eps)
-                return x / norm
-            query = _l2norm_torch(query.contiguous())
-            key = _l2norm_torch(key.contiguous())
+            query, key = apply_gdn_qk_l2norm(query, key)
         if self.num_value_heads // self.num_key_heads > 1:
             query = query.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
             key = key.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
@@ -383,28 +415,14 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        if self.config.deterministic_mode or not self.fla_supported:
-            core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=False,
-                use_qk_l2norm_in_kernel=False,
-            )
-        else:
-            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=False,
-                use_qk_l2norm_in_kernel=False,
-            )
+        core_attn_out, last_recurrent_state = run_gated_delta_rule(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            self.config.deterministic_mode,
+        )
         nvtx_range_pop(suffix="gated_delta_rule")
 
         # RMSNorm
@@ -619,10 +637,10 @@ def torch_chunk_gated_delta_rule(
 
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
-        # Use PyTorch-native l2norm instead of fla's triton kernel
         def _l2norm_torch(x, dim=-1, eps=1e-6):
             norm = torch.norm(x, p=2, dim=dim, keepdim=True).clamp(min=eps)
             return x / norm
+
         query = _l2norm_torch(query, dim=-1, eps=1e-6)
         key = _l2norm_torch(key, dim=-1, eps=1e-6)
     query, key, value, beta, g = [
