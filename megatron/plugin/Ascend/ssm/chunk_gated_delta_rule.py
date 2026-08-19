@@ -1,7 +1,7 @@
-# Copyright (c) 2025, BAAI. All rights reserved.
+# Copyright (c) 2026, BAAI. All rights reserved.
 #
-# NPU AscendC kernel integration for Gated Delta Net (GDN).
-# Replaces the fla triton/CUDA path and the slow PyTorch fallback on Ascend NPU.
+# AscendC kernel integration for Gated Delta Net (GDN).
+# Replaces the FLA Triton/CUDA path and the slow PyTorch fallback on Ascend.
 #
 # Kernel source: flash-linear-attention-npu/torch_custom/fla_npu
 # Op signatures from: npu_custom.yaml
@@ -24,181 +24,24 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Lazy-loaded triton-on-NPU ops
-_NPU_OPS_AVAILABLE: Optional[bool] = None
+# Lazy-loaded Triton-on-Ascend ops
+_OPS_AVAILABLE: Optional[bool] = None
 _chunk_local_cumsum = None
 _chunk_scaled_dot_kkt_fwd = None
 _solve_tril = None
-_l2norm = None
 
 
-# ============================================================
-# Pure PyTorch implementations of triton utility ops.
-# These replace fla's triton kernels which fail to compile on NPU.
-# They are lightweight relative to the AscendC compute kernels.
-# ============================================================
+def _ensure_ops() -> bool:
+    """Lazy initialization of Ascend FLA ops. Call once before first use."""
+    global _OPS_AVAILABLE, _chunk_local_cumsum, _chunk_scaled_dot_kkt_fwd, _solve_tril
 
-def _torch_chunk_local_cumsum(
-    g: torch.Tensor,
-    chunk_size: int = 64,
-    reverse: bool = False,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    head_first: bool = True,
-    output_dtype: Optional[torch.dtype] = torch.float,
-    **kwargs,
-) -> torch.Tensor:
-    """Pure PyTorch chunk_local_cumsum: cumsum within each chunk.
-    
-    Input g: [B, H, T] (head_first=True) or [B, T, H] (head_first=False)
-    Output: same shape, cumsum within each chunk of size chunk_size.
-    """
-    if output_dtype is None:
-        output_dtype = g.dtype
-
-    if not head_first:
-        g = g.transpose(1, 2)  # -> [B, H, T]
-
-    B, H, T = g.shape
-    # Pad T to multiple of chunk_size
-    pad = (chunk_size - T % chunk_size) % chunk_size
-    if pad > 0:
-        g = torch.nn.functional.pad(g, (0, pad))
-
-    # Reshape to chunks: [B, H, NT, C]
-    g_chunks = g.reshape(B, H, -1, chunk_size).to(output_dtype)
-
-    if reverse:
-        g_chunks = g_chunks.flip(-1)
-
-    g_cumsum = g_chunks.cumsum(-1)
-
-    if reverse:
-        g_cumsum = g_cumsum.flip(-1)
-
-    # Reshape back and trim
-    result = g_cumsum.reshape(B, H, -1)[:, :, :T]
-
-    if not head_first:
-        result = result.transpose(1, 2)
-
-    return result.contiguous()
-
-
-def _torch_chunk_scaled_dot_kkt_fwd(
-    k: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    chunk_size: int = 64,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    output_dtype: torch.dtype = torch.float32,
-    **kwargs,
-) -> torch.Tensor:
-    """Pure PyTorch chunk_scaled_dot_kkt: compute A = tril(k @ k^T * beta * exp(g_i - g_j)).
-    
-    Input:
-        k: [B, H, T, K]
-        g: [B, H, T]  (after cumsum)
-        beta: [B, H, T]
-    Output:
-        A: [B, H, T, chunk_size] — strictly lower-triangular within each chunk
-           (stored as a flattened chunk dimension: T = NT * C, so shape [B, H, NT*C, C])
-           Actually fla stores it as [B, H, T, C] where T encodes chunk position.
-           
-    More precisely fla returns A with shape [B, H, NT, C, C] then views as [B, H, T, C].
-    Let's follow fla's convention.
-    """
-    B, H, T, K = k.shape
-    C = chunk_size
-    pad = (C - T % C) % C
-    if pad > 0:
-        k = torch.nn.functional.pad(k, (0, 0, 0, pad))
-        g = torch.nn.functional.pad(g, (0, pad))
-        beta = torch.nn.functional.pad(beta, (0, pad))
-    
-    T_padded = k.shape[2]
-    NT = T_padded // C
-    
-    # Reshape into chunks: [B, H, NT, C, K] and [B, H, NT, C]
-    k_chunks = k.reshape(B, H, NT, C, K).to(output_dtype)
-    g_chunks = g.reshape(B, H, NT, C).to(output_dtype)
-    beta_chunks = beta.reshape(B, H, NT, C).to(output_dtype)
-    
-    # fla kernel: kb = k * beta[:, None]; A = kb @ kb^T * exp(g_i - g_j)
-    # i.e. A[i,j] = (k[i]*beta[i]) @ (k[j]*beta[j]) * exp(g[i] - g[j])
-    kb = k_chunks * beta_chunks.unsqueeze(-1)  # [B, H, NT, C, K]
-    kkt = torch.matmul(kb, kb.transpose(-1, -2))  # [B, H, NT, C, C]
-    
-    # Gate differences: exp(g[i] - g[j])
-    g_diff = g_chunks.unsqueeze(-1) - g_chunks.unsqueeze(-2)  # [B, H, NT, C, C]
-    decay = torch.exp(g_diff)
-    
-    A = kkt * decay  # [B, H, NT, C, C]
-    
-    # Strictly lower triangular
-    mask = torch.tril(torch.ones(C, C, device=k.device, dtype=torch.bool), diagonal=-1)
-    A = A.masked_fill(~mask, 0)
-    
-    # fla convention: reshape to [B, H, T, C] (treating NT*C as T, last dim is chunk_size)
-    # Actually looking at solve_tril, it expects [B, T, H, BT] with head_first=False
-    # But within our function we work in head_first=True.
-    # Let's return [B, H, NT*C, C] = [B, H, T_padded, C] then trim:
-    A = A.reshape(B, H, T_padded, C)
-    
-    if pad > 0:
-        A = A[:, :, :T, :]
-    
-    return A.to(output_dtype)
-
-
-def _torch_solve_tril(
-    A: torch.Tensor,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    chunk_size: int = 64,
-    **kwargs,
-) -> torch.Tensor:
-    """Pure PyTorch solve_tril: compute (I + A)^{-1} where A is strictly lower triangular.
-    
-    Input A: [B, H, T, C] where T = NT * C (chunk-aligned)
-    Output: same shape, (I + A)^{-1} per chunk.
-    Results are cast to fp16 to match fla's triton kernel behavior (prevents numerical explosion).
-    """
-    B, H, T, C = A.shape
-    NT = T // C
-    
-    # Reshape to [B*H*NT, C, C]
-    A_blocks = A.reshape(B, H, NT, C, C)
-    A_flat = A_blocks.reshape(-1, C, C)
-    
-    # I + A is unit lower triangular; compute its inverse
-    I = torch.eye(C, device=A.device, dtype=A.dtype).unsqueeze(0).expand_as(A_flat)
-    IpA = I + A_flat
-    
-    # Solve (I+A) * X = I  =>  X = (I+A)^{-1}
-    Ai = torch.linalg.solve_triangular(IpA, I, upper=False, unitriangular=True)
-    
-    # Critical: fla's triton kernel stores result in fp16, which naturally clips
-    # extreme values. Replace Inf/NaN with 0 then clamp to fp16 range.
-    Ai = torch.nan_to_num(Ai, nan=0.0, posinf=65504.0, neginf=-65504.0)
-    Ai = Ai.clamp(-65504.0, 65504.0)
-    
-    # Reshape back
-    Ai = Ai.reshape(B, H, NT, C, C)
-    Ai = Ai.reshape(B, H, T, C)
-    
-    return Ai
-
-
-def _ensure_npu_ops() -> bool:
-    """Lazy initialization of NPU FLA ops. Call once before first use."""
-    global _NPU_OPS_AVAILABLE, _chunk_local_cumsum, _chunk_scaled_dot_kkt_fwd, _solve_tril, _l2norm
-
-    if _NPU_OPS_AVAILABLE is not None:
-        return _NPU_OPS_AVAILABLE
+    if _OPS_AVAILABLE is not None:
+        return _OPS_AVAILABLE
 
     try:
         import fla_npu  # noqa: F401 — loads .so and registers torch.ops.npu.*
 
-        # Use triton-on-NPU ops from fla_npu (faster, matches fla numerical behavior)
+        # Use Triton-on-Ascend ops from fla_npu (faster and numerically aligned with FLA).
         from fla_npu.ops.triton import (
             chunk_local_cumsum_scalar as _triton_cumsum,
             chunk_scaled_dot_kkt_fwd as _triton_kkt,
@@ -208,7 +51,6 @@ def _ensure_npu_ops() -> bool:
         _chunk_local_cumsum = _triton_cumsum
         _chunk_scaled_dot_kkt_fwd = _triton_kkt
         _solve_tril = _triton_solve
-        _l2norm = None  # l2norm handled separately in gated_delta_net.py
 
         # Verify AscendC ops are registered
         required_ops = [
@@ -224,13 +66,13 @@ def _ensure_npu_ops() -> bool:
         for op_name in required_ops:
             assert hasattr(torch.ops.npu, op_name), f"{op_name} not registered"
 
-        _NPU_OPS_AVAILABLE = True
-        logger.info("NPU FLA AscendC ops loaded successfully for GDN.")
+        _OPS_AVAILABLE = True
+        logger.info("Ascend FLA ops loaded successfully for GDN.")
         return True
 
     except (ImportError, AssertionError) as e:
-        logger.warning(f"NPU FLA ops not available: {e}")
-        _NPU_OPS_AVAILABLE = False
+        logger.warning(f"Ascend FLA ops not available: {e}")
+        _OPS_AVAILABLE = False
         return False
 
 
@@ -265,15 +107,15 @@ def _compute_chunk_indices(
     return indices
 
 
-class NPUChunkGatedDeltaRuleFunction(torch.autograd.Function):
+class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
     """
-    Autograd Function that implements chunk_gated_delta_rule using NPU AscendC kernels.
+    Autograd Function that implements chunk_gated_delta_rule using AscendC kernels.
 
     Accepts the SAME tensor format as fla's chunk_gated_delta_rule:
         q, k, v: [B, H, T, K/V]  (already transposed by caller or internally)
         g, beta:  [B, H, T]
     
-    NPU AscendC ops also expect [B, H, T, D] — no additional transpose needed.
+    AscendC ops also expect [B, H, T, D] — no additional transpose needed.
     """
 
     @staticmethod
@@ -484,7 +326,7 @@ class NPUChunkGatedDeltaRuleFunction(torch.autograd.Function):
         return dq, dk, dv_final, dg, dbeta, None, dh0, None, None, None
 
 
-def npu_chunk_gated_delta_rule(
+def _chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -499,7 +341,7 @@ def npu_chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
-    NPU-accelerated chunk gated delta rule.
+    Ascend-accelerated chunk gated delta rule.
 
     Drop-in replacement for fla's chunk_gated_delta_rule on Ascend NPU.
     Uses AscendC custom kernels for compute-heavy ops (fwd_h, bwd_dhu, fwd_o, etc.)
@@ -527,13 +369,13 @@ def npu_chunk_gated_delta_rule(
         o: same layout as q (either [B, T, H, V] or [B, H, T, V])
         final_state: [B, H, K, V] or None
     """
-    if not _ensure_npu_ops():
+    if not _ensure_ops():
         raise RuntimeError(
-            "NPU FLA ops not available. Install fla_npu package and ensure "
+            "Ascend FLA ops not available. Install fla_npu and ensure "
             "AscendC kernels are built."
         )
 
-    # Transpose to head_first [B, H, T, D] for NPU ops
+    # Transpose to head_first [B, H, T, D] for Ascend ops
     if not head_first:
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
@@ -544,7 +386,7 @@ def npu_chunk_gated_delta_rule(
     if scale is None:
         scale = q.shape[-1] ** -0.5
 
-    o, final_state = NPUChunkGatedDeltaRuleFunction.apply(
+    o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q, k, v, g, beta, scale, initial_state, output_final_state,
         cu_seqlens, chunk_size,
     )
@@ -554,3 +396,49 @@ def npu_chunk_gated_delta_rule(
         o = o.transpose(1, 2).contiguous()
 
     return o, final_state
+
+
+def chunk_gated_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float = None,
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens_cpu: Optional[torch.Tensor] = None,
+    cp_context=None,
+    transpose_state_layout: bool = False,
+    **kwargs,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Adapt the current FLA public API to the Ascend implementation."""
+    chunk_size = kwargs.pop("chunk_size", 64)
+    head_first = kwargs.pop("head_first", False)
+
+    if cu_seqlens_cpu is not None:
+        raise NotImplementedError("Ascend GDN does not support cu_seqlens_cpu")
+    if cp_context is not None:
+        raise NotImplementedError("Ascend GDN does not support context parallelism")
+    if transpose_state_layout:
+        raise NotImplementedError("Ascend GDN does not support transpose_state_layout=True")
+    if kwargs:
+        unsupported = ", ".join(sorted(kwargs))
+        raise NotImplementedError(f"Unsupported Ascend GDN arguments: {unsupported}")
+
+    return _chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        head_first=head_first,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )

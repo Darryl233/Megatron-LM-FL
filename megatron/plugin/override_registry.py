@@ -132,13 +132,13 @@ register(
 # SSM - Gated Delta Net
 # =============================================================================
 register(
-    target="megatron.core.ssm.gated_delta_net.apply_gdn_qk_l2norm",
-    impl="megatron.plugin.Ascend.ssm.gated_delta_net.apply_gdn_qk_l2norm",
+    target="fla.modules.l2norm.l2norm",
+    impl="fla_npu.ops.triton.l2norm",
     vendor="npu",
 )
 
 register(
-    target="megatron.core.ssm.gated_delta_net.run_gated_delta_rule",
-    impl="megatron.plugin.Ascend.ssm.gated_delta_net.run_gated_delta_rule",
+    target="fla.ops.gated_delta_rule.chunk.chunk_gated_delta_rule",
+    impl="megatron.plugin.Ascend.ssm.chunk_gated_delta_rule.chunk_gated_delta_rule",
     vendor="npu",
 )

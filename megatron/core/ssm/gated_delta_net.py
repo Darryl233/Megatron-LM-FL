@@ -43,9 +43,16 @@ try:
 
     HAVE_FLA = True
 except ImportError:
+    l2norm = None
     chunk_gated_delta_rule = None
 
     HAVE_FLA = False
+
+if HAVE_FLA:
+    # Keep the FLA call sites intact while allowing platform plugins to replace
+    # the imported kernels locally in this module.
+    l2norm = overridable(l2norm)
+    chunk_gated_delta_rule = overridable(chunk_gated_delta_rule)
 
 try:
     from causal_conv1d import causal_conv1d_fn
@@ -55,50 +62,6 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
-
-
-@overridable
-def apply_gdn_qk_l2norm(query: Tensor, key: Tensor) -> Tuple[Tensor, Tensor]:
-    """Portable Q/K normalization used when no platform plugin overrides it."""
-
-    def _l2norm_torch(x: Tensor, eps: float = 1e-6) -> Tensor:
-        norm = torch.norm(x, p=2, dim=-1, keepdim=True).clamp(min=eps)
-        return x / norm
-
-    return _l2norm_torch(query.contiguous()), _l2norm_torch(key.contiguous())
-
-
-@overridable
-def run_gated_delta_rule(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    g: Tensor,
-    beta: Tensor,
-    deterministic_mode: bool,
-):
-    """Run the portable deterministic path or the regular FLA implementation."""
-    if deterministic_mode or not HAVE_FLA:
-        return torch_chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-        )
-    return chunk_gated_delta_rule(
-        query,
-        key,
-        value,
-        g=g,
-        beta=beta,
-        initial_state=None,
-        output_final_state=False,
-        use_qk_l2norm_in_kernel=False,
-    )
 
 
 @dataclass
@@ -395,7 +358,8 @@ class GatedDeltaNet(MegatronModule):
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            query, key = apply_gdn_qk_l2norm(query, key)
+            query = l2norm(query.contiguous())
+            key = l2norm(key.contiguous())
         if self.num_value_heads // self.num_key_heads > 1:
             query = query.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
             key = key.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
@@ -415,14 +379,28 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, last_recurrent_state = run_gated_delta_rule(
-            query,
-            key,
-            value,
-            g,
-            beta,
-            self.config.deterministic_mode,
-        )
+        if self.config.deterministic_mode or not HAVE_FLA:
+            core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+            )
+        else:
+            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+            )
         nvtx_range_pop(suffix="gated_delta_rule")
 
         # RMSNorm
