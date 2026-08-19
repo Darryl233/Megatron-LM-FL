@@ -379,7 +379,7 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        if self.config.deterministic_mode or not HAVE_FLA:
+        if self.config.deterministic_mode:
             core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
                 query,
                 key,
@@ -615,12 +615,8 @@ def torch_chunk_gated_delta_rule(
 
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
-        def _l2norm_torch(x, dim=-1, eps=1e-6):
-            norm = torch.norm(x, p=2, dim=dim, keepdim=True).clamp(min=eps)
-            return x / norm
-
-        query = _l2norm_torch(query, dim=-1, eps=1e-6)
-        key = _l2norm_torch(key, dim=-1, eps=1e-6)
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
     ]
